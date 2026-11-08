@@ -11,7 +11,7 @@ A Pythonic data and utilities toolbox — Python equivalent of [`MyJuliaToolbox.
 ## Features
 
 - **DataFrame I/O** — Read/write DataFrames from CSV, Arrow, gzipped CSV, and Excel (`.xlsx`), with atomic writes
-- **Media interface** — Unified read/write abstraction over file system, SQLite database, SQL dump files, console, and archives (`.zip` / `.tar.gz`)
+- **Media interface** — Unified read/write abstraction over file system, SQLite database, SQL dump files, console, archives (`.zip` / `.tar.gz`), and MinIO / S3-compatible object stores
 - **Async logger** — Non-blocking structured logging to files, databases, or the console via a background thread
 - **Date utilities** — Integer `yyyymmdd` date helpers: `date2int`, `int2date`, `days_between`, `yearfrac`, `add_days_convention` (following/modified-following/previous conventions, holidays, custom weekends)
 - **DataFrame comparison** — Cell-level comparison with numeric tolerances, type checking, missing-value handling, and per-column precision
@@ -73,6 +73,21 @@ with DatabaseMedia("analytics.db") as db:
     result = read_dataframe(db, table="prices")
     custom = read_dataframe(db, query="SELECT id FROM prices WHERE value > 15")
 ```
+
+### MinIO / S3-Compatible Object Store
+
+```python
+from qfpytoolbox import MinIOMedia, minio_create_bucket, read_dataframe, write_dataframe
+
+# Credentials: the arguments, then MINIO_ACCESS_KEY / MINIO_SECRET_KEY, then AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+media = MinIOMedia("analytics", endpoint="https://minio.example.com", prefix="datasets/2025/q1")
+minio_create_bucket(media)
+
+write_dataframe(media, df, filename="prices.arrow")
+prices = read_dataframe(media, filename="prices.arrow")
+```
+
+To trust a private CA, set `AWS_CA_BUNDLE` to its certificate file. As a logging sink, records are held in memory and uploaded as one JSONL object by `stop_logger` or `minio_flush_log_buffer`.
 
 ### Async Logger
 
@@ -190,9 +205,9 @@ write_dataset(ArchiveMedia("myds.zip"), ds, overwrite=True)
 
 | Module | Description |
 |---|---|
-| `qfpytoolbox.io.media` | `iSourceMedia`, `FileSystemMedia`, `DatabaseMedia`, `SQLDumpMedia`, `ConsoleMedia`, `ArchiveMedia` |
+| `qfpytoolbox.io.media` | `iSourceMedia`, `FileSystemMedia`, `DatabaseMedia`, `SQLDumpMedia`, `ConsoleMedia`, `ArchiveMedia`, `MinIOMedia`, `minio_create_bucket`, `minio_list_objects` |
 | `qfpytoolbox.io.dataframes` | `read_dataframe`, `write_dataframe`, `read_csv_to_df`, `read_arrow_to_df` |
-| `qfpytoolbox.io.logger` | `AsyncLogger`, `LogRecord`, `log_info`, `log_warn`, `log_error`, `log_debug`, `stop_logger`, `flush_logger`, `dropped_logs` |
+| `qfpytoolbox.io.logger` | `AsyncLogger`, `LogRecord`, `log_info`, `log_warn`, `log_error`, `log_debug`, `stop_logger`, `flush_logger`, `dropped_logs`, `minio_flush_log_buffer` |
 | `qfpytoolbox.utils.dates` | `date2int`, `int2date`, `days_between`, `yearfrac`, `add_days_convention` |
 | `qfpytoolbox.utils.dataframe_compare` | `compare_dataframes`, `DataFrameComparisonResult` |
 | `qfpytoolbox.parameters` | `iParameters`, `parameters_from_dict`, `parameters_from_json`, `read_parameters`, `write_parameters` |

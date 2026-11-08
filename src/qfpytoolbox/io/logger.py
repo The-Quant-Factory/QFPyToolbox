@@ -6,9 +6,12 @@ thread so the calling code is never blocked by sink I/O.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -23,6 +26,7 @@ __all__ = [
     "flush_logger",
     "stop_logger",
     "dropped_logs",
+    "minio_flush_log_buffer",
 ]
 
 # ---------------------------------------------------------------------------
@@ -247,9 +251,14 @@ def flush_logger(logger: AsyncLogger) -> None:
 
 
 def stop_logger(logger: AsyncLogger) -> None:
-    """Close the queue and wait for the background worker to finish."""
+    """Close the queue, wait for the background worker to finish, and upload what a MinIO sink still holds."""
     logger._queue.close()
     logger._worker.join()
+
+    from qfpytoolbox.io.media import MinIOMedia  # noqa: PLC0415
+
+    if isinstance(logger.source, MinIOMedia):
+        minio_flush_log_buffer(logger.source)
 
 
 def dropped_logs(logger: AsyncLogger) -> int:
@@ -300,6 +309,7 @@ def _write_log_record(source: Any, record: LogRecord, **kwargs: Any) -> None:
         ConsoleMedia,
         DatabaseMedia,
         FileSystemMedia,
+        MinIOMedia,
         SQLDumpMedia,
     )
 
@@ -309,6 +319,8 @@ def _write_log_record(source: Any, record: LogRecord, **kwargs: Any) -> None:
         _write_to_console(source, record, **kwargs)
     elif isinstance(source, DatabaseMedia):
         _write_to_database(source, record, **kwargs)
+    elif isinstance(source, MinIOMedia):
+        _write_to_minio(source, record, **kwargs)
     elif isinstance(source, SQLDumpMedia):
         raise TypeError("SQLDumpMedia is read-only and cannot be used as a logging sink.")
     else:
@@ -355,3 +367,52 @@ def _write_to_database(source: Any, record: LogRecord, *, table: str = "logs", *
         ),
     )
     conn.commit()
+
+
+def _write_to_minio(source: Any, record: LogRecord, *, batch_logs: bool = True, **_: Any) -> None:
+    """Hold ``record`` for one later upload (S3 cannot append), or upload it now when ``batch_logs`` is false."""
+    if batch_logs:
+        with source._log_lock:
+            source._log_buffer.append(record)
+    else:
+        _upload_minio_log_records(source, [record])
+
+
+def minio_flush_log_buffer(media: Any) -> None:
+    """Upload the log records ``media`` holds as one JSONL object.
+
+    The object's key is ``{prefix}/logs/{yyyy-mm-dd}/{timestamp_ns}-{id}.jsonl``.  :func:`stop_logger`
+    calls this for a MinIO sink; call it yourself for periodic uploads.  If the upload fails, the
+    records stay held for the next attempt.
+    """
+    with media._log_lock:
+        records = list(media._log_buffer)
+        media._log_buffer.clear()
+    if not records:
+        return
+    try:
+        _upload_minio_log_records(media, records)
+    except Exception:
+        with media._log_lock:
+            media._log_buffer[:0] = records
+        raise
+
+
+def _upload_minio_log_records(media: Any, records: list[LogRecord]) -> None:
+    """Store ``records`` as one new JSONL object."""
+    lines = "".join(_log_record_to_jsonl(record) + "\n" for record in records)
+    date_text = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    key = media._key(f"logs/{date_text}/{time.time_ns()}-{uuid.uuid4().hex[:8]}.jsonl")
+    media._put_bytes(key, lines.encode("utf-8"), content_type="application/x-ndjson")
+
+
+def _log_record_to_jsonl(record: LogRecord) -> str:
+    """Return ``record`` as one line of JSON."""
+    return json.dumps(
+        {
+            "timestamp": record.timestamp.isoformat(),
+            "level": record.level,
+            "message": record.message,
+            "metadata": None if record.metadata is None else str(record.metadata),
+        }
+    )
