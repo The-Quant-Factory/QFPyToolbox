@@ -118,12 +118,15 @@ def read_dataframe(src: Any, *, format: str = "auto", **kwargs: Any):
         ConsoleMedia,
         DatabaseMedia,
         FileSystemMedia,
+        MinIOMedia,
         SQLDumpMedia,
         iSourceMedia,
     )
 
     if isinstance(src, FileSystemMedia):
         return _read_from_filesystem_media(src, format=format, **kwargs)
+    if isinstance(src, MinIOMedia):
+        return _read_from_minio_media(src, format=format, **kwargs)
     if isinstance(src, DatabaseMedia):
         return _read_from_database_media(src, **kwargs)
     if isinstance(src, SQLDumpMedia):
@@ -210,6 +213,47 @@ def _read_from_filesystem_media(media: Any, *, format: str = "auto", **kwargs: A
     else:
         path = media.path
     return _read_from_path(path, format=fmt, **kwargs)
+
+
+def _pop_minio_filename(options: dict[str, Any]) -> str:
+    """Remove and return the required ``filename`` option of a MinIO read or write."""
+    filename: str | None = options.pop("filename", None)
+    if filename is None:
+        raise ValueError("For MinIOMedia, provide filename=<object name>")
+    return filename
+
+
+def _resolve_minio_format(media: Any, filename: str, format: str) -> str:
+    """Return ``'csv'`` or ``'arrow'``: the call's format, else the media's, else the extension's."""
+    requested = format if format != "auto" else media.format
+    resolved = requested if requested != "auto" else _infer_format(filename)
+    if resolved not in ("csv", "arrow"):
+        raise ValueError(
+            f"Cannot use format {resolved!r} for object {filename!r}. "
+            "Pass format='arrow' or format='csv', or name the object .arrow or .csv."
+        )
+    if resolved == "arrow" and filename.lower().endswith(".gz"):
+        raise ValueError("Gzipped Arrow objects are not supported.")
+    return resolved
+
+
+def _read_arrow_bytes(data: bytes, **kwargs: Any):
+    """Read Arrow bytes in the IPC file format (Feather) or the IPC stream format, which MyJuliaToolbox writes."""
+    pa, feather = _import_pyarrow()
+    if data[:4] == b"\xff\xff\xff\xff":
+        return pa.ipc.open_stream(data).read_pandas(**kwargs)
+    return feather.read_feather(io.BytesIO(data), **kwargs)
+
+
+def _read_from_minio_media(media: Any, *, format: str = "auto", **kwargs: Any):
+    """Download one object and return it as a ``pandas.DataFrame``."""
+    filename = _pop_minio_filename(kwargs)
+    resolved_format = _resolve_minio_format(media, filename, format)
+    data = media._get_bytes(media._key(filename))
+    if resolved_format == "arrow":
+        return _read_arrow_bytes(data, **kwargs)
+    compression = "gzip" if filename.lower().endswith(".gz") else None
+    return _import_pandas().read_csv(io.BytesIO(data), compression=compression, **kwargs)
 
 
 def _read_from_database_media(media: Any, **kwargs: Any):
@@ -353,12 +397,15 @@ def write_dataframe(
         ConsoleMedia,
         DatabaseMedia,
         FileSystemMedia,
+        MinIOMedia,
         SQLDumpMedia,
         iSourceMedia,
     )
 
     if isinstance(dest, FileSystemMedia):
         return _write_to_filesystem_media(dest, df, format=format, overwrite=overwrite, atomic=atomic, **kwargs)
+    if isinstance(dest, MinIOMedia):
+        return _write_to_minio_media(dest, df, format=format, overwrite=overwrite, **kwargs)
     if isinstance(dest, DatabaseMedia):
         return _write_to_database_media(dest, df, **kwargs)
     if isinstance(dest, ConsoleMedia):
@@ -491,6 +538,25 @@ def _write_to_filesystem_media(
     else:
         path = media.path
     _write_to_path(path, df, format=fmt, overwrite=overwrite, atomic=atomic, **kwargs)
+
+
+def _write_to_minio_media(media: Any, df: Any, *, format: str, overwrite: bool, **kwargs: Any) -> None:
+    """Serialise ``df`` in memory and upload it as one object."""
+    filename = _pop_minio_filename(kwargs)
+    resolved_format = _resolve_minio_format(media, filename, format)
+    key = media._key(filename)
+    if not overwrite and media._exists(key):
+        raise FileExistsError(f"Object already exists: {key!r}. Pass overwrite=True to overwrite.")
+    if resolved_format == "arrow":
+        _, feather = _import_pyarrow()
+        buffer = io.BytesIO()
+        feather.write_feather(df, buffer, **kwargs)
+        media._put_bytes(key, buffer.getvalue(), content_type="application/vnd.apache.arrow.file")
+        return
+    data = df.to_csv(index=False, **kwargs).encode("utf-8")
+    if filename.lower().endswith(".gz"):
+        data = gzip.compress(data)
+    media._put_bytes(key, data, content_type="text/csv")
 
 
 def _write_to_database_media(media: Any, df: Any, **kwargs: Any) -> None:

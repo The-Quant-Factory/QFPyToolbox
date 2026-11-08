@@ -6,8 +6,10 @@ Mirrors Julia's ``iSourceMedia`` hierarchy from
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import threading
 from abc import ABC
 from typing import Any
 
@@ -18,6 +20,9 @@ __all__ = [
     "SQLDumpMedia",
     "ConsoleMedia",
     "ArchiveMedia",
+    "MinIOMedia",
+    "minio_create_bucket",
+    "minio_list_objects",
 ]
 
 # ---------------------------------------------------------------------------
@@ -380,3 +385,170 @@ class ArchiveMedia(iSourceMedia):
 
     def __repr__(self) -> str:
         return f"ArchiveMedia({self.path!r}, format={self.format!r})"
+
+
+# ---------------------------------------------------------------------------
+# MinIOMedia
+# ---------------------------------------------------------------------------
+
+_MINIO_FORMATS = ("auto", "csv", "arrow")
+
+# What S3 answers for something absent. A HEAD response has no body, so its code is the bare HTTP status.
+_MINIO_NOT_FOUND_CODES: frozenset[str] = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _import_boto3() -> tuple[Any, Any]:
+    """Return ``boto3`` and botocore's ``Config``, which are optional dependencies."""
+    try:
+        import boto3  # noqa: PLC0415
+        from botocore.config import Config  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            'boto3 is required for MinIOMedia. Install it with: pip install "qfpytoolbox[minio]"'
+        ) from exc
+    return boto3, Config
+
+
+def _minio_credential(explicit: str | None, *variable_names: str) -> str:
+    """Return ``explicit`` when given, else the first non-empty environment variable, else ``""``."""
+    if explicit is not None:
+        return explicit
+    for variable_name in variable_names:
+        value = os.environ.get(variable_name, "")
+        if value:
+            return value
+    return ""
+
+
+def _is_not_found(error: Any) -> bool:
+    """Tell whether a botocore ``ClientError`` says that the object or bucket is absent."""
+    return error.response.get("Error", {}).get("Code") in _MINIO_NOT_FOUND_CODES
+
+
+class MinIOMedia(iSourceMedia):
+    """A media backend for a MinIO (or any S3-compatible) object store.
+
+    Each object is stored at key ``{prefix}/{filename}`` inside ``bucket``.  Mirrors
+    ``MinIOMedia`` in ``MyJuliaToolbox.jl/src/io/media_minio.jl``.  Requires the
+    ``[minio]`` extra.
+
+    Parameters
+    ----------
+    bucket:
+        Target bucket (create it first with :func:`minio_create_bucket`).
+    endpoint:
+        Server base URL.
+    access_key, secret_key:
+        Credentials.  Resolved in this order: the argument, then ``MINIO_ACCESS_KEY`` /
+        ``MINIO_SECRET_KEY``, then ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY``.
+    region:
+        Region tag (MinIO ignores it).
+    prefix:
+        Logical directory inside the bucket.
+    format:
+        Default format (``"auto"``, ``"csv"``, ``"arrow"``).  ``"auto"`` (default)
+        infers the format from the object's extension.
+    tls_verify:
+        ``False`` skips certificate checks for this client (development only).
+        To trust a private CA, set ``AWS_CA_BUNDLE`` to its certificate file.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        endpoint: str = "http://localhost:9000",
+        access_key: str | None = None,
+        secret_key: str | None = None,
+        region: str = "us-east-1",
+        prefix: str = "",
+        format: str = "auto",
+        tls_verify: bool = True,
+    ) -> None:
+        boto3, config_class = _import_boto3()
+        if format not in _MINIO_FORMATS:
+            raise ValueError(f"Unsupported format: {format!r}. Choose from: {sorted(_MINIO_FORMATS)}")
+        resolved_access_key = _minio_credential(access_key, "MINIO_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
+        resolved_secret_key = _minio_credential(secret_key, "MINIO_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
+        if not resolved_access_key:
+            raise ValueError("MinIOMedia: access_key is empty. Pass it explicitly or set MINIO_ACCESS_KEY.")
+        if not resolved_secret_key:
+            raise ValueError("MinIOMedia: secret_key is empty. Pass it explicitly or set MINIO_SECRET_KEY.")
+
+        self.bucket = bucket
+        self.endpoint = endpoint.rstrip("/")
+        self.prefix = prefix.strip("/")
+        self.format = format
+        self._log_buffer: list[Any] = []
+        self._log_lock = threading.Lock()
+        self._client = boto3.client(
+            "s3",
+            endpoint_url=self.endpoint,
+            aws_access_key_id=resolved_access_key,
+            aws_secret_access_key=resolved_secret_key,
+            region_name=region,
+            # None, not True: only None lets botocore honour AWS_CA_BUNDLE.
+            verify=None if tls_verify else False,
+            config=config_class(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"MinIOMedia({self.bucket!r}, endpoint={self.endpoint!r}, prefix={self.prefix!r}, format={self.format!r})"
+        )
+
+    def _key(self, relative_path: str) -> str:
+        """Join ``prefix`` and ``relative_path`` into an object key, always with forward slashes."""
+        relative = relative_path.replace("\\", "/")
+        if not self.prefix:
+            return relative
+        return f"{self.prefix}/{relative.lstrip('/')}"
+
+    def _exists(self, key: str) -> bool:
+        """Tell whether ``key`` exists.  Any answer other than "absent" (403, for one) is raised."""
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            self._client.head_object(Bucket=self.bucket, Key=key)
+        except ClientError as error:
+            if _is_not_found(error):
+                return False
+            raise
+        return True
+
+    def _get_bytes(self, key: str) -> bytes:
+        """Return the content of ``key``; an absent object raises ``FileNotFoundError``."""
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as error:
+            if _is_not_found(error):
+                raise FileNotFoundError(f"Object not found: {key!r} in bucket {self.bucket!r}") from error
+            raise
+        return response["Body"].read()
+
+    def _put_bytes(self, key: str, data: bytes, *, content_type: str = "application/octet-stream") -> None:
+        """Store ``data`` at ``key``, replacing any object already there."""
+        self._client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+
+
+def minio_create_bucket(media: MinIOMedia) -> None:
+    """Create the bucket of ``media`` if it does not exist yet."""
+    from botocore.exceptions import ClientError  # noqa: PLC0415
+
+    try:
+        media._client.head_bucket(Bucket=media.bucket)
+    except ClientError as error:
+        if not _is_not_found(error):
+            raise
+        media._client.create_bucket(Bucket=media.bucket)
+
+
+def minio_list_objects(media: MinIOMedia, *, prefix: str | None = None) -> list[str]:
+    """Return every object key under ``prefix`` (default: the media's own prefix)."""
+    base = media.prefix if prefix is None else prefix
+    search_prefix = f"{base}/" if base else ""
+    paginator = media._client.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=media.bucket, Prefix=search_prefix)
+    return [item["Key"] for page in pages for item in page.get("Contents", [])]
