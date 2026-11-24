@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import io
 import json
@@ -15,6 +16,7 @@ boto3 = pytest.importorskip("boto3")
 
 from botocore.exceptions import ClientError  # noqa: E402
 
+from qfpytoolbox.dataset import iDataSet, read_dataset, write_dataset  # noqa: E402
 from qfpytoolbox.io.dataframes import read_dataframe, write_dataframe  # noqa: E402
 from qfpytoolbox.io.logger import AsyncLogger, log_info, minio_flush_log_buffer, stop_logger  # noqa: E402
 from qfpytoolbox.io.media import MinIOMedia, minio_create_bucket, minio_list_objects  # noqa: E402
@@ -73,6 +75,12 @@ class FakeS3Client:
         self._refuse_if_denied("put_object")
         self.objects[Key] = Body
         self.content_types[Key] = ContentType
+        return {}
+
+    def delete_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+        self._refuse_if_denied("delete_object")
+        self.objects.pop(Key, None)
+        self.content_types.pop(Key, None)
         return {}
 
     def head_bucket(self, Bucket: str) -> dict:  # noqa: N803
@@ -235,19 +243,75 @@ class TestDataFrames:
         with pytest.raises(ValueError, match="Cannot use format"):
             write_dataframe(media, FRAME, filename="prices.bin")
 
-    def test_excel_is_refused(self, media):
-        with pytest.raises(ValueError, match="Cannot use format"):
-            read_dataframe(media, filename="prices.xlsx")
+    def test_excel_round_trip(self, media, s3_client):
+        write_dataframe(media, FRAME, filename="prices.xlsx", sheet="prices")
+        assert s3_client.content_types["prices.xlsx"] == (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        assert s3_client.objects["prices.xlsx"].startswith(b"PK")
+        pd.testing.assert_frame_equal(read_dataframe(media, filename="prices.xlsx", sheet="prices"), FRAME)
+
+    def test_excel_bytes_are_those_of_a_local_file(self, media, s3_client, tmp_path):
+        write_dataframe(media, FRAME, filename="prices.xlsx")
+        local = tmp_path / "prices.xlsx"
+        local.write_bytes(s3_client.objects["prices.xlsx"])
+        pd.testing.assert_frame_equal(read_dataframe(str(local)), FRAME)
+
+    def test_media_format_excel_for_an_unknown_extension(self, s3_client):
+        media = MinIOMedia("bucket", access_key="a", secret_key="s", format="excel")
+        write_dataframe(media, FRAME, filename="prices.bin")
+        assert s3_client.content_types["prices.bin"] == (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        pd.testing.assert_frame_equal(read_dataframe(media, filename="prices.bin"), FRAME)
+
+    def test_tsv_is_csv_with_its_own_content_type(self, media, s3_client):
+        write_dataframe(media, FRAME, filename="prices.tsv", sep="\t")
+        assert s3_client.content_types["prices.tsv"] == "text/tab-separated-values"
+        assert s3_client.objects["prices.tsv"].startswith(b"id\tvalue\n")
+        pd.testing.assert_frame_equal(read_dataframe(media, filename="prices.tsv", sep="\t"), FRAME)
+
+    def test_gzipped_csv_is_typed_as_gzip(self, media, s3_client):
+        write_dataframe(media, FRAME, filename="prices.csv.gz")
+        assert s3_client.content_types["prices.csv.gz"] == "application/gzip"
+
+    def test_feather_name_is_arrow(self, media, s3_client):
+        write_dataframe(media, FRAME, filename="prices.feather")
+        assert s3_client.content_types["prices.feather"] == "application/vnd.apache.arrow.file"
+        pd.testing.assert_frame_equal(read_dataframe(media, filename="prices.feather"), FRAME)
 
     def test_gzipped_arrow_is_refused(self, media):
         with pytest.raises(ValueError, match="Gzipped Arrow"):
             write_dataframe(media, FRAME, filename="prices.arrow.gz")
 
-    def test_read_requires_a_filename(self, media):
+    def test_gzipped_excel_is_refused(self, media):
+        with pytest.raises(ValueError, match="Gzipped Excel"):
+            write_dataframe(media, FRAME, filename="prices.xlsx.gz", format="excel")
+
+
+class TestObjectWithoutFilename:
+    def test_the_prefix_names_the_object(self, s3_client):
+        media = MinIOMedia("bucket", access_key="a", secret_key="s", prefix="zones/prices.arrow")
+        write_dataframe(media, FRAME)
+        assert list(s3_client.objects) == ["zones/prices.arrow"]
+        assert s3_client.content_types["zones/prices.arrow"] == "application/vnd.apache.arrow.file"
+        pd.testing.assert_frame_equal(read_dataframe(media), FRAME)
+
+    def test_the_format_comes_from_the_last_part_of_the_prefix(self, s3_client):
+        media = MinIOMedia("bucket", access_key="a", secret_key="s", prefix="tables.csv/prices.xlsx")
+        write_dataframe(media, FRAME)
+        assert s3_client.objects["tables.csv/prices.xlsx"].startswith(b"PK")
+
+    def test_a_filename_still_names_an_object_under_the_prefix(self, s3_client):
+        media = MinIOMedia("bucket", access_key="a", secret_key="s", prefix="zones/prices.arrow")
+        write_dataframe(media, FRAME, filename="other.csv")
+        assert list(s3_client.objects) == ["zones/prices.arrow/other.csv"]
+
+    def test_read_without_filename_and_prefix_raises(self, media):
         with pytest.raises(ValueError, match="provide filename"):
             read_dataframe(media)
 
-    def test_write_requires_a_filename(self, media):
+    def test_write_without_filename_and_prefix_raises(self, media):
         with pytest.raises(ValueError, match="provide filename"):
             write_dataframe(media, FRAME)
 
@@ -371,3 +435,100 @@ class TestLogSink:
         s3_client.denied_operations.clear()
         minio_flush_log_buffer(media)
         assert len(self.log_keys(s3_client)) == 1
+
+
+@dataclasses.dataclass
+class PricesDataSet(iDataSet):
+    prices: pd.DataFrame
+    label: str
+    count: int
+
+
+def prices_dataset() -> PricesDataSet:
+    return PricesDataSet(prices=FRAME, label="mock", count=3)
+
+
+@pytest.fixture
+def dataset_media(s3_client):
+    return MinIOMedia("bucket", access_key="a", secret_key="s", prefix="datasets/prices")
+
+
+class TestDatasets:
+    def test_write_uploads_the_files_of_a_folder_under_the_prefix(self, dataset_media, s3_client):
+        write_dataset(dataset_media, prices_dataset())
+        assert sorted(s3_client.objects) == [
+            "datasets/prices/data.json",
+            "datasets/prices/data_info.json",
+            "datasets/prices/prices.arrow",
+        ]
+        assert s3_client.content_types["datasets/prices/prices.arrow"] == "application/vnd.apache.arrow.file"
+        assert s3_client.content_types["datasets/prices/data.json"] == "application/json"
+
+    def test_typed_round_trip(self, dataset_media):
+        write_dataset(dataset_media, prices_dataset())
+        result = read_dataset(PricesDataSet, dataset_media)
+        assert isinstance(result, PricesDataSet)
+        assert (result.label, result.count) == ("mock", 3)
+        pd.testing.assert_frame_equal(result.prices, FRAME)
+
+    def test_untyped_read_resolves_the_declared_type(self, dataset_media):
+        write_dataset(dataset_media, prices_dataset())
+        assert isinstance(read_dataset(dataset_media), PricesDataSet)
+
+    def test_csv_round_trip(self, dataset_media, s3_client):
+        write_dataset(dataset_media, prices_dataset(), file_format="csv")
+        assert s3_client.content_types["datasets/prices/prices.csv"] == "text/csv"
+        result = read_dataset(PricesDataSet, dataset_media, file_format="csv")
+        pd.testing.assert_frame_equal(result.prices, FRAME)
+
+    def test_existing_objects_refuse_the_write_before_any_upload(self, dataset_media, s3_client):
+        s3_client.objects["datasets/prices/data.json"] = b"{}"
+        with pytest.raises(FileExistsError, match="overwrite=True"):
+            write_dataset(dataset_media, prices_dataset())
+        assert list(s3_client.objects) == ["datasets/prices/data.json"]
+
+    def test_overwrite_replaces_the_objects(self, dataset_media):
+        write_dataset(dataset_media, prices_dataset())
+        write_dataset(dataset_media, PricesDataSet(prices=FRAME.head(1), label="new", count=1), overwrite=True)
+        result = read_dataset(PricesDataSet, dataset_media)
+        assert (result.label, len(result.prices)) == ("new", 1)
+
+    def test_a_failed_upload_deletes_what_was_uploaded(self, dataset_media, s3_client, monkeypatch):
+        calls = []
+        original = s3_client.put_object
+
+        def put_then_fail(**arguments):
+            calls.append(arguments["Key"])
+            if len(calls) == 2:
+                raise client_error("InternalError", "PutObject")
+            return original(**arguments)
+
+        monkeypatch.setattr(s3_client, "put_object", put_then_fail)
+        with pytest.raises(ClientError):
+            write_dataset(dataset_media, prices_dataset())
+        assert s3_client.objects == {}
+
+    def test_without_atomic_the_uploaded_objects_stay(self, dataset_media, s3_client, monkeypatch):
+        calls = []
+        original = s3_client.put_object
+
+        def put_then_fail(**arguments):
+            calls.append(arguments["Key"])
+            if len(calls) == 2:
+                raise client_error("InternalError", "PutObject")
+            return original(**arguments)
+
+        monkeypatch.setattr(s3_client, "put_object", put_then_fail)
+        with pytest.raises(ClientError):
+            write_dataset(dataset_media, prices_dataset(), atomic=False)
+        assert list(s3_client.objects) == [calls[0]]
+
+    def test_an_empty_prefix_raises_on_read(self, dataset_media):
+        with pytest.raises(ValueError, match="No objects found"):
+            read_dataset(dataset_media)
+
+    def test_a_key_leaving_the_folder_is_refused(self, dataset_media, s3_client):
+        write_dataset(dataset_media, prices_dataset())
+        s3_client.objects["datasets/prices/../escape.json"] = b"{}"
+        with pytest.raises(ValueError, match="Refusing object key"):
+            read_dataset(dataset_media)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from qfpytoolbox.io.arrow_tables import read_arrow_table, write_arrow_table
 from qfpytoolbox.io.dataframes import (
     read_arrow_to_df,
     read_csv_to_df,
@@ -48,6 +49,9 @@ __all__ = [
     "write_dataframe",
     "read_csv_to_df",
     "read_arrow_to_df",
+    # arrow tables
+    "read_arrow_table",
+    "write_arrow_table",
     # logger
     "LogRecord",
     "AsyncLogger",

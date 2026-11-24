@@ -7,7 +7,9 @@ plus typed parameter sub-objects.
 ``write_dataset`` / ``read_dataset`` persist datasets to / from a directory
 (each DataFrame as a separate Arrow or CSV file, metadata in ``data.json``,
 type info in ``data_info.json``).  Archive (``.zip`` / ``.tar.gz``) I/O is
-supported through :class:`~qfpytoolbox.io.media.ArchiveMedia`.
+supported through :class:`~qfpytoolbox.io.media.ArchiveMedia`, and object-store
+I/O through :class:`~qfpytoolbox.io.media.MinIOMedia` (the dataset's files become
+objects under the media's prefix).
 """
 
 from __future__ import annotations
@@ -104,19 +106,21 @@ def write_dataset(
     source:
         :class:`~qfpytoolbox.io.media.FileSystemMedia`,
         :class:`~qfpytoolbox.io.media.ArchiveMedia`,
-        :class:`~qfpytoolbox.io.media.ConsoleMedia`, or a plain ``str`` path.
+        :class:`~qfpytoolbox.io.media.ConsoleMedia`,
+        :class:`~qfpytoolbox.io.media.MinIOMedia`, or a plain ``str`` path.
     dataset:
         The ``iDataSet`` instance to persist.
     file_format:
         File format for DataFrame fields — ``"arrow"`` (default) or ``"csv"``.
     overwrite:
-        Allow overwriting existing files.
+        Allow overwriting existing files (or objects).
     atomic:
-        Use atomic writes for DataFrame files (default ``True``).
+        Use atomic writes for DataFrame files (default ``True``).  For a ``MinIOMedia``, which has no
+        multi-object commit, a failed upload deletes the objects already uploaded by this call.
     pretty:
         Pretty-print JSON output (default ``True``).
     """
-    from qfpytoolbox.io.media import ArchiveMedia, ConsoleMedia, FileSystemMedia  # noqa: PLC0415
+    from qfpytoolbox.io.media import ArchiveMedia, ConsoleMedia, FileSystemMedia, MinIOMedia  # noqa: PLC0415
 
     if isinstance(source, str):
         if _is_archive_path(source):
@@ -132,9 +136,11 @@ def write_dataset(
         _write_to_archive(source, dataset, file_format=file_format, overwrite=overwrite, pretty=pretty)
     elif isinstance(source, ConsoleMedia):
         _write_to_console(source, dataset, pretty=pretty)
+    elif isinstance(source, MinIOMedia):
+        _write_to_minio(source, dataset, file_format=file_format, overwrite=overwrite, atomic=atomic, pretty=pretty)
     else:
         raise TypeError(
-            f"write_dataset is only implemented for FileSystemMedia, ArchiveMedia, and ConsoleMedia. "
+            f"write_dataset is only implemented for FileSystemMedia, ArchiveMedia, ConsoleMedia, and MinIOMedia. "
             f"Got: {type(source).__name__!r}"
         )
 
@@ -240,6 +246,52 @@ def _pack_directory_to_archive(src_dir: str, archive_path: str, fmt: str, *, ove
         raise ValueError(f"Unsupported archive format: {fmt!r}")
 
 
+def _write_to_minio(
+    media: Any,
+    dataset: iDataSet,
+    *,
+    file_format: str,
+    overwrite: bool,
+    atomic: bool,
+    pretty: bool,
+) -> None:
+    """Write ``dataset`` to a temporary folder as a ``FileSystemMedia``, then upload each file under the prefix.
+
+    Without ``overwrite``, every key is checked before the first upload, so a refusal uploads nothing.  With
+    ``atomic``, a failed upload deletes the objects this call uploaded (S3 has no multi-object commit, so this
+    is a clean-up, not a transaction).  Mirrors ``_write_dataset_impl(::MinIOMedia)`` in ``MyJuliaToolbox.jl``.
+    """
+    from qfpytoolbox.io.media import _minio_content_type  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _write_to_filesystem(tmp_dir, dataset, file_format=file_format, overwrite=True, atomic=False, pretty=pretty)
+        uploads: list[tuple[str, str]] = []
+        for root, _, files in os.walk(tmp_dir):
+            for name in sorted(files):
+                local_path = os.path.join(root, name)
+                relative = os.path.relpath(local_path, tmp_dir).replace(os.sep, "/")
+                uploads.append((media._key(relative), local_path))
+        if not overwrite:
+            existing = [key for key, _ in uploads if media._exists(key)]
+            if existing:
+                raise FileExistsError(f"Objects already exist: {existing!r}. Pass overwrite=True to overwrite.")
+        uploaded: list[str] = []
+        try:
+            for key, local_path in uploads:
+                with open(local_path, "rb") as stream:
+                    media._put_bytes(key, stream.read(), content_type=_minio_content_type(key))
+                uploaded.append(key)
+        except Exception:
+            if atomic:
+                for key in uploaded:
+                    # Best-effort clean-up: the upload error is the one raised.
+                    try:
+                        media._delete(key)
+                    except Exception:
+                        pass
+            raise
+
+
 def _write_to_console(source: Any, dataset: iDataSet, *, pretty: bool) -> None:
     import pandas as pd  # noqa: PLC0415
 
@@ -303,8 +355,10 @@ def read_dataset(
     - A ``str`` directory path or archive path (``.zip``, ``.tar.gz``).
     - A :class:`~qfpytoolbox.io.media.FileSystemMedia`.
     - A :class:`~qfpytoolbox.io.media.ArchiveMedia`.
+    - A :class:`~qfpytoolbox.io.media.MinIOMedia`: the objects under its prefix are downloaded to a temporary
+      folder, then read as a ``FileSystemMedia`` (so the type comes from ``data_info.json``, as for a folder).
     """
-    from qfpytoolbox.io.media import ArchiveMedia, FileSystemMedia  # noqa: PLC0415
+    from qfpytoolbox.io.media import ArchiveMedia, FileSystemMedia, MinIOMedia  # noqa: PLC0415
 
     # typed call: read_dataset(MyClass, source, ...)
     cls: type | None
@@ -333,9 +387,12 @@ def read_dataset(
         return loaded
     elif isinstance(src, ArchiveMedia):
         return _read_from_archive(src, cls=cls, file_format=file_format)
+    elif isinstance(src, MinIOMedia):
+        return _read_from_minio(src, cls=cls, file_format=file_format)
     else:
         raise TypeError(
-            f"read_dataset is only implemented for FileSystemMedia and ArchiveMedia. Got: {type(src).__name__!r}"
+            "read_dataset is only implemented for FileSystemMedia, ArchiveMedia, and MinIOMedia. "
+            f"Got: {type(src).__name__!r}"
         )
 
 
@@ -377,6 +434,35 @@ def _read_from_archive(media: Any, *, cls: type | None, file_format: str) -> Any
         else:
             raise ValueError(f"Unsupported archive format: {media.format!r}")
 
+        fs_media = FileSystemMedia(tmp_dir)
+        if cls is not None:
+            return read_dataset(cls, fs_media, file_format=file_format)
+        return read_dataset(fs_media, file_format=file_format)
+
+
+def _read_from_minio(media: Any, *, cls: type | None, file_format: str) -> Any:
+    """Download every object under the media's prefix into a temporary folder and read it as a ``FileSystemMedia``.
+
+    Mirrors ``read_dataset(::MinIOMedia)`` in ``MyJuliaToolbox.jl``.  A prefix holding no object raises
+    ``ValueError``; a key that would leave the temporary folder (a ``..`` part) is refused.
+    """
+    from qfpytoolbox.io.media import FileSystemMedia, minio_list_objects  # noqa: PLC0415
+
+    keys = minio_list_objects(media)
+    if not keys:
+        raise ValueError(
+            f"No objects found at bucket={media.bucket!r}, prefix={media.prefix!r}. Has the dataset been written yet?"
+        )
+    search_prefix = f"{media.prefix}/" if media.prefix else ""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for key in keys:
+            parts = key[len(search_prefix) :].split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                raise ValueError(f"Refusing object key {key!r}: it does not name a file under the prefix.")
+            destination = os.path.join(tmp_dir, *parts)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with open(destination, "wb") as stream:
+                stream.write(media._get_bytes(key))
         fs_media = FileSystemMedia(tmp_dir)
         if cls is not None:
             return read_dataset(cls, fs_media, file_format=file_format)

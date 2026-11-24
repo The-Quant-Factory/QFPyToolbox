@@ -215,25 +215,22 @@ def _read_from_filesystem_media(media: Any, *, format: str = "auto", **kwargs: A
     return _read_from_path(path, format=fmt, **kwargs)
 
 
-def _pop_minio_filename(options: dict[str, Any]) -> str:
-    """Remove and return the required ``filename`` option of a MinIO read or write."""
-    filename: str | None = options.pop("filename", None)
-    if filename is None:
-        raise ValueError("For MinIOMedia, provide filename=<object name>")
-    return filename
+def _minio_object_name(key: str) -> str:
+    """Return the last part of an object key: the name a local file holding the object would get."""
+    return key.rsplit("/", 1)[-1]
 
 
-def _resolve_minio_format(media: Any, filename: str, format: str) -> str:
-    """Return ``'csv'`` or ``'arrow'``: the call's format, else the media's, else the extension's."""
+def _resolve_minio_format(media: Any, name: str, format: str) -> str:
+    """Return ``'csv'``, ``'arrow'`` or ``'excel'``: the call's format, else the media's, else the extension's."""
     requested = format if format != "auto" else media.format
-    resolved = requested if requested != "auto" else _infer_format(filename)
-    if resolved not in ("csv", "arrow"):
+    resolved = requested if requested != "auto" else _infer_format(name)
+    if resolved not in ("csv", "arrow", "excel"):
         raise ValueError(
-            f"Cannot use format {resolved!r} for object {filename!r}. "
-            "Pass format='arrow' or format='csv', or name the object .arrow or .csv."
+            f"Cannot use format {resolved!r} for object {name!r}. "
+            "Pass format='arrow', 'csv' or 'excel', or name the object .arrow, .feather, .csv, .tsv, .txt or .xlsx."
         )
-    if resolved == "arrow" and filename.lower().endswith(".gz"):
-        raise ValueError("Gzipped Arrow objects are not supported.")
+    if resolved in ("arrow", "excel") and name.lower().endswith(".gz"):
+        raise ValueError(f"Gzipped {'Arrow' if resolved == 'arrow' else 'Excel'} objects are not supported.")
     return resolved
 
 
@@ -246,13 +243,20 @@ def _read_arrow_bytes(data: bytes, **kwargs: Any):
 
 
 def _read_from_minio_media(media: Any, *, format: str = "auto", **kwargs: Any):
-    """Download one object and return it as a ``pandas.DataFrame``."""
-    filename = _pop_minio_filename(kwargs)
-    resolved_format = _resolve_minio_format(media, filename, format)
-    data = media._get_bytes(media._key(filename))
+    """Download one object and return it as a ``pandas.DataFrame``, as a local file of that name would be read.
+
+    The object is ``filename`` under the media's prefix; without ``filename``, the object whose key is the prefix.
+    """
+    key = media._object_key(kwargs.pop("filename", None))
+    name = _minio_object_name(key)
+    resolved_format = _resolve_minio_format(media, name, format)
+    data = media._get_bytes(key)
     if resolved_format == "arrow":
         return _read_arrow_bytes(data, **kwargs)
-    compression = "gzip" if filename.lower().endswith(".gz") else None
+    if resolved_format == "excel":
+        sheet = kwargs.pop("sheet", 0)
+        return _import_pandas().read_excel(io.BytesIO(data), sheet_name=sheet, **kwargs)
+    compression = "gzip" if name.lower().endswith(".gz") else None
     return _import_pandas().read_csv(io.BytesIO(data), compression=compression, **kwargs)
 
 
@@ -541,22 +545,33 @@ def _write_to_filesystem_media(
 
 
 def _write_to_minio_media(media: Any, df: Any, *, format: str, overwrite: bool, **kwargs: Any) -> None:
-    """Serialise ``df`` in memory and upload it as one object."""
-    filename = _pop_minio_filename(kwargs)
-    resolved_format = _resolve_minio_format(media, filename, format)
-    key = media._key(filename)
+    """Serialise ``df`` in memory, as a local file of the object's name would be written, and upload it.
+
+    The object is ``filename`` under the media's prefix; without ``filename``, the object whose key is the prefix.
+    Its content type comes from its name's extension, else from the format.
+    """
+    from qfpytoolbox.io.media import _minio_content_type  # noqa: PLC0415
+
+    key = media._object_key(kwargs.pop("filename", None))
+    name = _minio_object_name(key)
+    resolved_format = _resolve_minio_format(media, name, format)
     if not overwrite and media._exists(key):
         raise FileExistsError(f"Object already exists: {key!r}. Pass overwrite=True to overwrite.")
     if resolved_format == "arrow":
         _, feather = _import_pyarrow()
         buffer = io.BytesIO()
         feather.write_feather(df, buffer, **kwargs)
-        media._put_bytes(key, buffer.getvalue(), content_type="application/vnd.apache.arrow.file")
-        return
-    data = df.to_csv(index=False, **kwargs).encode("utf-8")
-    if filename.lower().endswith(".gz"):
-        data = gzip.compress(data)
-    media._put_bytes(key, data, content_type="text/csv")
+        data = buffer.getvalue()
+    elif resolved_format == "excel":
+        sheet = kwargs.pop("sheet", "Sheet1")
+        buffer = io.BytesIO()
+        df.to_excel(buffer, sheet_name=sheet, index=False, **kwargs)
+        data = buffer.getvalue()
+    else:
+        data = df.to_csv(index=False, **kwargs).encode("utf-8")
+        if name.lower().endswith(".gz"):
+            data = gzip.compress(data)
+    media._put_bytes(key, data, content_type=_minio_content_type(name, resolved_format))
 
 
 def _write_to_database_media(media: Any, df: Any, **kwargs: Any) -> None:
