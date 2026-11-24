@@ -391,7 +391,25 @@ class ArchiveMedia(iSourceMedia):
 # MinIOMedia
 # ---------------------------------------------------------------------------
 
-_MINIO_FORMATS = ("auto", "csv", "arrow")
+_MINIO_FORMATS = ("auto", "csv", "arrow", "excel")
+
+# The content type an object gets from its name's extension, checked in this order; ``.gz`` first, since a gzipped
+# CSV is stored compressed.  Mirrors ``_minio_content_type`` in ``MyJuliaToolbox.jl/src/io/media_minio.jl``.
+_MINIO_CONTENT_TYPES_BY_EXTENSION: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((".gz",), "application/gzip"),
+    ((".arrow", ".feather"), "application/vnd.apache.arrow.file"),
+    ((".csv", ".txt"), "text/csv"),
+    ((".tsv",), "text/tab-separated-values"),
+    ((".xlsx",), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ((".json",), "application/json"),
+)
+
+# The content type of an object whose name has none of the extensions above, from the format it is written in.
+_MINIO_CONTENT_TYPES_BY_FORMAT: dict[str, str] = {
+    "csv": "text/csv",
+    "arrow": "application/vnd.apache.arrow.file",
+    "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 # What S3 answers for something absent. A HEAD response has no body, so its code is the bare HTTP status.
 _MINIO_NOT_FOUND_CODES: frozenset[str] = frozenset({"404", "NoSuchKey", "NotFound"})
@@ -420,6 +438,15 @@ def _minio_credential(explicit: str | None, *variable_names: str) -> str:
     return ""
 
 
+def _minio_content_type(name: str, format: str | None = None) -> str:
+    """Return the content type of an object named ``name``: from its extension, else from ``format``."""
+    lowered = name.lower()
+    for extensions, content_type in _MINIO_CONTENT_TYPES_BY_EXTENSION:
+        if lowered.endswith(extensions):
+            return content_type
+    return _MINIO_CONTENT_TYPES_BY_FORMAT.get(format or "", "application/octet-stream")
+
+
 def _is_not_found(error: Any) -> bool:
     """Tell whether a botocore ``ClientError`` says that the object or bucket is absent."""
     return error.response.get("Error", {}).get("Code") in _MINIO_NOT_FOUND_CODES
@@ -428,9 +455,11 @@ def _is_not_found(error: Any) -> bool:
 class MinIOMedia(iSourceMedia):
     """A media backend for a MinIO (or any S3-compatible) object store.
 
-    Each object is stored at key ``{prefix}/{filename}`` inside ``bucket``.  Mirrors
-    ``MinIOMedia`` in ``MyJuliaToolbox.jl/src/io/media_minio.jl``.  Requires the
-    ``[minio]`` extra.
+    Each object is stored at key ``{prefix}/{filename}`` inside ``bucket``.  A data frame call without
+    ``filename`` names the object whose key is the prefix itself, as a ``FileSystemMedia`` without
+    ``filename`` names its own path.  An object holds the bytes a local file of the same name would hold,
+    so the formats and their inference from the extension are those of a ``FileSystemMedia``.  Mirrors
+    ``MinIOMedia`` in ``MyJuliaToolbox.jl/src/io/media_minio.jl``.  Requires the ``[minio]`` extra.
 
     Parameters
     ----------
@@ -446,7 +475,7 @@ class MinIOMedia(iSourceMedia):
     prefix:
         Logical directory inside the bucket.
     format:
-        Default format (``"auto"``, ``"csv"``, ``"arrow"``).  ``"auto"`` (default)
+        Default format (``"auto"``, ``"csv"``, ``"arrow"``, ``"excel"``).  ``"auto"`` (default)
         infers the format from the object's extension.
     tls_verify:
         ``False`` skips certificate checks for this client (development only).
@@ -504,6 +533,16 @@ class MinIOMedia(iSourceMedia):
             return relative
         return f"{self.prefix}/{relative.lstrip('/')}"
 
+    def _object_key(self, filename: str | None) -> str:
+        """Return the key a data frame call names: ``filename`` under the prefix, else the prefix itself."""
+        if filename is not None:
+            return self._key(filename)
+        if not self.prefix:
+            raise ValueError(
+                "For MinIOMedia, provide filename=<object name>, or a prefix naming the object (the prefix is empty)."
+            )
+        return self.prefix
+
     def _exists(self, key: str) -> bool:
         """Tell whether ``key`` exists.  Any answer other than "absent" (403, for one) is raised."""
         from botocore.exceptions import ClientError  # noqa: PLC0415
@@ -531,6 +570,10 @@ class MinIOMedia(iSourceMedia):
     def _put_bytes(self, key: str, data: bytes, *, content_type: str = "application/octet-stream") -> None:
         """Store ``data`` at ``key``, replacing any object already there."""
         self._client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+
+    def _delete(self, key: str) -> None:
+        """Delete ``key``; S3 answers success for an absent key too."""
+        self._client.delete_object(Bucket=self.bucket, Key=key)
 
 
 def minio_create_bucket(media: MinIOMedia) -> None:

@@ -42,10 +42,12 @@ from qfpytoolbox.io import (
     minio_create_bucket,
     minio_flush_log_buffer,
     minio_list_objects,
+    read_arrow_table,
     read_arrow_to_df,
     read_csv_to_df,
     read_dataframe,
     stop_logger,
+    write_arrow_table,
     write_dataframe,
 )
 from qfpytoolbox.parameters import (
@@ -85,6 +87,9 @@ __all__ = [
     "write_dataframe",
     "read_csv_to_df",
     "read_arrow_to_df",
+    # io — arrow tables
+    "read_arrow_table",
+    "write_arrow_table",
     # io — logger
     "LogRecord",
     "AsyncLogger",

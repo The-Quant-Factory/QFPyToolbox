@@ -11,12 +11,13 @@ A Pythonic data and utilities toolbox — Python equivalent of [`MyJuliaToolbox.
 ## Features
 
 - **DataFrame I/O** — Read/write DataFrames from CSV, Arrow, gzipped CSV, and Excel (`.xlsx`), with atomic writes
+- **Arrow tables** — Lossless `pyarrow.Table` read/write (`read_arrow_table`, `write_arrow_table`) that keeps nullable integer types and schema/field metadata
 - **Media interface** — Unified read/write abstraction over file system, SQLite database, SQL dump files, console, archives (`.zip` / `.tar.gz`), and MinIO / S3-compatible object stores
 - **Async logger** — Non-blocking structured logging to files, databases, or the console via a background thread
 - **Date utilities** — Integer `yyyymmdd` date helpers: `date2int`, `int2date`, `days_between`, `yearfrac`, `add_days_convention` (following/modified-following/previous conventions, holidays, custom weekends)
 - **DataFrame comparison** — Cell-level comparison with numeric tolerances, type checking, missing-value handling, and per-column precision
 - **Parameters** — JSON-backed configuration with `iParameters`, typed round-trip serialisation, and media-aware `read_parameters`/`write_parameters`
-- **Datasets** — Typed dataset persistence with `iDataSet`: DataFrames as Arrow/CSV, metadata as JSON, archive I/O
+- **Datasets** — Typed dataset persistence with `iDataSet`: DataFrames as Arrow/CSV, metadata as JSON, archive and MinIO I/O
 
 ---
 
@@ -63,6 +64,17 @@ write_dataframe(media, df, filename="prices.arrow", format="arrow", overwrite=Tr
 df5 = read_dataframe(media, filename="prices.arrow")
 ```
 
+### Arrow Tables (lossless)
+
+```python
+import pyarrow as pa
+from qfpytoolbox import read_arrow_table, write_arrow_table
+
+table = pa.table({"count": pa.array([1, None, 3], pa.int64())})
+write_arrow_table("table.arrow", table, overwrite=True)  # atomic, Arrow IPC file format
+same = read_arrow_table("table.arrow")                   # also reads the Arrow IPC stream format
+```
+
 ### SQLite Database
 
 ```python
@@ -85,9 +97,14 @@ minio_create_bucket(media)
 
 write_dataframe(media, df, filename="prices.arrow")
 prices = read_dataframe(media, filename="prices.arrow")
+write_dataframe(media, df, filename="prices.xlsx")  # same formats as FileSystemMedia: CSV, TSV, gzipped CSV, Arrow, Excel
+
+# Without filename, the prefix names the object
+one = MinIOMedia("analytics", endpoint="https://minio.example.com", prefix="zones/prices.arrow")
+write_dataframe(one, df)
 ```
 
-To trust a private CA, set `AWS_CA_BUNDLE` to its certificate file. As a logging sink, records are held in memory and uploaded as one JSONL object by `stop_logger` or `minio_flush_log_buffer`.
+An object holds the bytes a local file of the same name would hold; its content type comes from its extension. To trust a private CA, set `AWS_CA_BUNDLE` to its certificate file. As a logging sink, records are held in memory and uploaded as one JSONL object by `stop_logger` or `minio_flush_log_buffer`.
 
 ### Async Logger
 
@@ -197,6 +214,12 @@ loaded = read_dataset("/tmp/myds")
 # Archive I/O
 from qfpytoolbox import ArchiveMedia
 write_dataset(ArchiveMedia("myds.zip"), ds, overwrite=True)
+
+# MinIO I/O: one object per file, under the prefix
+from qfpytoolbox import MinIOMedia
+store = MinIOMedia("analytics", endpoint="https://minio.example.com", prefix="datasets/myds")
+write_dataset(store, ds)
+loaded = read_dataset(MyDataSet, store)
 ```
 
 ---
@@ -207,6 +230,7 @@ write_dataset(ArchiveMedia("myds.zip"), ds, overwrite=True)
 |---|---|
 | `qfpytoolbox.io.media` | `iSourceMedia`, `FileSystemMedia`, `DatabaseMedia`, `SQLDumpMedia`, `ConsoleMedia`, `ArchiveMedia`, `MinIOMedia`, `minio_create_bucket`, `minio_list_objects` |
 | `qfpytoolbox.io.dataframes` | `read_dataframe`, `write_dataframe`, `read_csv_to_df`, `read_arrow_to_df` |
+| `qfpytoolbox.io.arrow_tables` | `read_arrow_table`, `write_arrow_table` |
 | `qfpytoolbox.io.logger` | `AsyncLogger`, `LogRecord`, `log_info`, `log_warn`, `log_error`, `log_debug`, `stop_logger`, `flush_logger`, `dropped_logs`, `minio_flush_log_buffer` |
 | `qfpytoolbox.utils.dates` | `date2int`, `int2date`, `days_between`, `yearfrac`, `add_days_convention` |
 | `qfpytoolbox.utils.dataframe_compare` | `compare_dataframes`, `DataFrameComparisonResult` |

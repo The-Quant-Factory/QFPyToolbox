@@ -30,6 +30,7 @@ src/qfpytoolbox/
 │   ├── __init__.py
 │   ├── media.py             # iSourceMedia and all concrete backends
 │   ├── dataframes.py        # read_dataframe, write_dataframe
+│   ├── arrow_tables.py      # read_arrow_table, write_arrow_table (lossless pyarrow.Table I/O)
 │   └── logger.py            # AsyncLogger, LogRecord, log_* helpers
 └── utils/
     ├── __init__.py
